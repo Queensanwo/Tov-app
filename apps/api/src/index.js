@@ -1,4 +1,4 @@
-// TOV Phase 3 API — + dashboard + TV remote. Run: npm run dev:api
+// TOV Phase 4 API — + screen time + continuity. Run: npm run dev:api
 import http from 'node:http';
 import { query } from './db.js';
 import { validateFamily, validateProfile, validateRuleSet, checkGuard } from './validate.js';
@@ -29,7 +29,7 @@ const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://x');
 
     if (req.method === 'GET' && url.pathname === '/health') {
-      send(res, 200, { ok: true, phase: 3 });
+      send(res, 200, { ok: true, phase: 4 });
       return;
     }
 
@@ -201,6 +201,77 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // PUT /screen-time/rules {family_id, profile_id, scope, device, weekday/weekend limits} (PC04)
+    if (req.method === 'PUT' && url.pathname === '/screen-time/rules') {
+      const b = await body(req);
+      const guard = checkGuard({ role: req.headers['x-role'], headerFamilyId: req.headers['x-family-id'], bodyFamilyId: b.family_id });
+      if (guard) { send(res, 403, { error: guard }); return; }
+      if (!b.profile_id) { send(res, 400, { error: 'profile_id required' }); return; }
+      const r = await query(
+        `INSERT INTO screen_time_rules(family_id, profile_id, scope, device, weekday_limit_sec, weekend_limit_sec)
+         VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT (family_id, profile_id, device)
+         DO UPDATE SET scope=EXCLUDED.scope, weekday_limit_sec=EXCLUDED.weekday_limit_sec, weekend_limit_sec=EXCLUDED.weekend_limit_sec RETURNING *`,
+        [b.family_id, b.profile_id, b.scope || 'combined', b.device || 'all', b.weekday_limit_sec ?? 3600, b.weekend_limit_sec ?? 5400]
+      );
+      send(res, 200, { rule: r.rows[0] });
+      return;
+    }
+
+    // POST /screen-time/consume {family_id, profile_id, device, seconds} — heartbeat; paused sessions don't consume
+    if (req.method === 'POST' && url.pathname === '/screen-time/consume') {
+      const b = await body(req);
+      if (!b.family_id || !b.profile_id) { send(res, 400, { error: 'family_id + profile_id required' }); return; }
+      if (req.headers['x-family-id'] !== b.family_id) { send(res, 403, { error: 'family mismatch (isolation)' }); return; }
+      const s = await query('SELECT status FROM sessions WHERE family_id=$1 AND profile_id=$2 ORDER BY updated_at DESC LIMIT 1', [b.family_id, b.profile_id]);
+      if (s.rows[0]?.status === 'paused' || s.rows[0]?.status === 'stopped') { send(res, 200, { consumed: false, reason: `session ${s.rows[0].status}` }); return; }
+      const device = b.device || 'all';
+      await query(
+        `INSERT INTO screen_time_usage(family_id, profile_id, device, day, used_sec) VALUES($1,$2,$3,CURRENT_DATE,$4)
+         ON CONFLICT (family_id, profile_id, device, day) DO UPDATE SET used_sec = screen_time_usage.used_sec + EXCLUDED.used_sec`,
+        [b.family_id, b.profile_id, device, b.seconds || 60]
+      );
+      send(res, 200, { consumed: true });
+      return;
+    }
+
+    // GET /screen-time/status/:family_id/:profile_id — limits + used today + remaining
+    if (req.method === 'GET' && /^\/screen-time\/status\/[^/]+\/[^/]+$/.test(url.pathname)) {
+      const [, , , familyId, profileId] = url.pathname.split('/');
+      if (req.headers['x-family-id'] !== familyId) { send(res, 403, { error: 'family mismatch (isolation)' }); return; }
+      const device = url.searchParams.get('device') || 'all';
+      const rule = await query('SELECT * FROM screen_time_rules WHERE family_id=$1 AND profile_id=$2 AND device=$3', [familyId, profileId, device]);
+      const use = await query('SELECT used_sec FROM screen_time_usage WHERE family_id=$1 AND profile_id=$2 AND device=$3 AND day=CURRENT_DATE', [familyId, profileId, device]);
+      const isWeekend = [0, 6].includes(new Date().getDay());
+      const limit = rule.rows[0] ? (isWeekend ? rule.rows[0].weekend_limit_sec : rule.rows[0].weekday_limit_sec) : null;
+      const used = use.rows[0]?.used_sec || 0;
+      send(res, 200, { limit_sec: limit, used_sec: used, remaining_sec: limit == null ? null : Math.max(0, limit - used) });
+      return;
+    }
+
+    // PUT /continuity/state {family_id, profile_id, last/next video, progress} — last-write-wins
+    if (req.method === 'PUT' && url.pathname === '/continuity/state') {
+      const b = await body(req);
+      if (!b.family_id || !b.profile_id) { send(res, 400, { error: 'family_id + profile_id required' }); return; }
+      if (req.headers['x-family-id'] !== b.family_id) { send(res, 403, { error: 'family mismatch (isolation)' }); return; }
+      const r = await query(
+        `INSERT INTO continuity_state(family_id, profile_id, last_video_id, next_video_id, progress, updated_at)
+         VALUES($1,$2,$3,$4,$5::jsonb,now()) ON CONFLICT (family_id, profile_id)
+         DO UPDATE SET last_video_id=EXCLUDED.last_video_id, next_video_id=EXCLUDED.next_video_id, progress=EXCLUDED.progress, updated_at=now() RETURNING *`,
+        [b.family_id, b.profile_id, b.last_video_id || null, b.next_video_id || null, JSON.stringify(b.progress || {})]
+      );
+      send(res, 200, { state: r.rows[0] });
+      return;
+    }
+
+    // GET /continuity/state/:family_id/:profile_id — resume anywhere
+    if (req.method === 'GET' && /^\/continuity\/state\/[^/]+\/[^/]+$/.test(url.pathname)) {
+      const [, , , familyId, profileId] = url.pathname.split('/');
+      if (req.headers['x-family-id'] !== familyId) { send(res, 403, { error: 'family mismatch (isolation)' }); return; }
+      const r = await query('SELECT * FROM continuity_state WHERE family_id=$1 AND profile_id=$2', [familyId, profileId]);
+      send(res, 200, { state: r.rows[0] || null });
+      return;
+    }
+
     send(res, 404, { error: 'not-found' });
   } catch (e) {
     send(res, 500, { error: String(e.message || e) });
@@ -208,4 +279,4 @@ const server = http.createServer(async (req, res) => {
 });
 
 const port = process.env.PORT || 4000;
-server.listen(port, () => console.log(`tov-api phase3 on :${port}`));
+server.listen(port, () => console.log(`tov-api phase4 on :${port}`));
