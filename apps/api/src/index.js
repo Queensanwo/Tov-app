@@ -1,4 +1,4 @@
-// TOV Phase 2 API — Quick Setup + review engine + quiet playback. Run: npm run dev:api
+// TOV Phase 3 API — + dashboard + TV remote. Run: npm run dev:api
 import http from 'node:http';
 import { query } from './db.js';
 import { validateFamily, validateProfile, validateRuleSet, checkGuard } from './validate.js';
@@ -29,7 +29,7 @@ const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://x');
 
     if (req.method === 'GET' && url.pathname === '/health') {
-      send(res, 200, { ok: true, phase: 2 });
+      send(res, 200, { ok: true, phase: 3 });
       return;
     }
 
@@ -152,6 +152,55 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // POST /sessions/select {family_id, profile_id, device, mode} — parent binds profile to TV/device (§10)
+    if (req.method === 'POST' && url.pathname === '/sessions/select') {
+      const b = await body(req);
+      const guard = checkGuard({ role: req.headers['x-role'], headerFamilyId: req.headers['x-family-id'], bodyFamilyId: b.family_id });
+      if (guard) { send(res, 403, { error: guard }); return; }
+      if (!b.profile_id || !['child', 'learning'].includes(b.mode || 'child')) { send(res, 400, { error: 'profile_id + mode child|learning required' }); return; }
+      const r = await query(
+        'INSERT INTO sessions(family_id, profile_id, device, mode, status) VALUES($1,$2,$3,$4,\'playing\') RETURNING *',
+        [b.family_id, b.profile_id, b.device || 'tv', b.mode || 'child']
+      );
+      send(res, 201, { session: r.rows[0] });
+      return;
+    }
+
+    // GET /dashboard/:family_id — parent-first live view (PC01, PC06)
+    if (req.method === 'GET' && /^\/dashboard\/[^/]+$/.test(url.pathname)) {
+      const familyId = url.pathname.split('/')[2];
+      if (req.headers['x-family-id'] !== familyId) { send(res, 403, { error: 'family mismatch (isolation)' }); return; }
+      if (req.headers['x-role'] !== 'parent_admin') { send(res, 403, { error: 'parent_admin only' }); return; }
+      const live = await query('SELECT DISTINCT ON (profile_id) * FROM sessions WHERE family_id=$1 ORDER BY profile_id, updated_at DESC', [familyId]);
+      const recent = await query('SELECT * FROM activity_events WHERE family_id=$1 ORDER BY created_at DESC LIMIT 20', [familyId]);
+      const counts = await query("SELECT kind, count(*)::int AS n FROM activity_events WHERE family_id=$1 GROUP BY kind", [familyId]);
+      send(res, 200, { live: live.rows, recent: recent.rows, counts: counts.rows });
+      return;
+    }
+
+    // POST /remote/command {family_id, session_id, command, args} — pause/stop/mode/send/extend (PC02)
+    if (req.method === 'POST' && url.pathname === '/remote/command') {
+      const b = await body(req);
+      const guard = checkGuard({ role: req.headers['x-role'], headerFamilyId: req.headers['x-family-id'], bodyFamilyId: b.family_id });
+      if (guard) { send(res, 403, { error: guard }); return; }
+      const allowed = ['pause', 'stop', 'resume', 'switch_mode', 'send_video', 'extend_time'];
+      if (!allowed.includes(b.command)) { send(res, 400, { error: `command must be ${allowed.join('|')}` }); return; }
+      const s = await query('SELECT * FROM sessions WHERE id=$1 AND family_id=$2', [b.session_id, b.family_id]);
+      if (!s.rows[0]) { send(res, 404, { error: 'session not found' }); return; }
+      const cur = s.rows[0];
+      let status = cur.status, mode = cur.mode, video = cur.current_video_id;
+      if (b.command === 'pause') status = 'paused';
+      if (b.command === 'stop') status = 'stopped';
+      if (b.command === 'resume') status = 'playing';
+      if (b.command === 'switch_mode' && ['child', 'learning'].includes(b.args?.mode)) mode = b.args.mode;
+      if (b.command === 'send_video' && b.args?.video_id) { video = b.args.video_id; status = 'playing'; }
+      const upd = await query('UPDATE sessions SET status=$1, mode=$2, current_video_id=$3, updated_at=now() WHERE id=$4 RETURNING *', [status, mode, video, b.session_id]);
+      await query("INSERT INTO activity_events(family_id, profile_id, kind, video_id, detail) VALUES($1,$2,'remote_command',$3,$4)",
+        [b.family_id, cur.profile_id, video, JSON.stringify({ command: b.command, args: b.args || {} })]);
+      send(res, 200, { session: upd.rows[0] });
+      return;
+    }
+
     send(res, 404, { error: 'not-found' });
   } catch (e) {
     send(res, 500, { error: String(e.message || e) });
@@ -159,4 +208,4 @@ const server = http.createServer(async (req, res) => {
 });
 
 const port = process.env.PORT || 4000;
-server.listen(port, () => console.log(`tov-api phase2 on :${port}`));
+server.listen(port, () => console.log(`tov-api phase3 on :${port}`));
