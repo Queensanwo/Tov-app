@@ -1,0 +1,8 @@
+{
+  "name": "tov-learning-worker",
+  "version": "0.0.1",
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/path.test.js"
+  }
+}

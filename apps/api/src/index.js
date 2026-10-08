@@ -1,8 +1,9 @@
-// TOV Phase 4 API — + screen time + continuity. Run: npm run dev:api
+// TOV Phase 5 API — + learning paths. Run: npm run dev:api
 import http from 'node:http';
 import { query } from './db.js';
 import { validateFamily, validateProfile, validateRuleSet, checkGuard } from './validate.js';
 import { reviewVideo, pickNextSafe } from '../../../workers/review/src/engine.js';
+import { buildPath, recommendStartLevel, progressStats } from '../../../workers/learning/src/path.js';
 
 async function activeRule(family_id, profile_id) {
   if (profile_id) {
@@ -29,7 +30,7 @@ const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://x');
 
     if (req.method === 'GET' && url.pathname === '/health') {
-      send(res, 200, { ok: true, phase: 4 });
+      send(res, 200, { ok: true, phase: 5 });
       return;
     }
 
@@ -272,6 +273,46 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // POST /learning/paths {family_id, profile_id, goal, options_per_level, candidates[], self_assessed} (SL01-04)
+    if (req.method === 'POST' && url.pathname === '/learning/paths') {
+      const b = await body(req);
+      if (!b.family_id || !b.profile_id || !b.goal) { send(res, 400, { error: 'family_id + profile_id + goal required' }); return; }
+      if (req.headers['x-family-id'] !== b.family_id) { send(res, 403, { error: 'family mismatch (isolation)' }); return; }
+      const startLevel = recommendStartLevel({ selfAssessed: b.self_assessed });
+      const built = buildPath({ goal: b.goal, startLevel, candidates: b.candidates || [], optionsPerLevel: b.options_per_level || 3 });
+      const r = await query(
+        'INSERT INTO learning_paths(family_id, profile_id, goal, start_level, levels) VALUES($1,$2,$3,$4,$5::jsonb) RETURNING *',
+        [b.family_id, b.profile_id, b.goal, built.start_level, JSON.stringify(built.levels)]
+      );
+      send(res, 201, { path: r.rows[0], start_level: built.start_level, next_three: built.next_three, final_goal: built.final_goal, estimated_sec: built.estimated_sec, outline: built.outline });
+      return;
+    }
+
+    // GET /learning/paths/:family_id/:profile_id — list with stats (SL07)
+    if (req.method === 'GET' && /^\/learning\/paths\/[^/]+\/[^/]+$/.test(url.pathname)) {
+      const [, , , familyId, profileId] = url.pathname.split('/');
+      if (req.headers['x-family-id'] !== familyId) { send(res, 403, { error: 'family mismatch (isolation)' }); return; }
+      const r = await query('SELECT * FROM learning_paths WHERE family_id=$1 AND profile_id=$2 ORDER BY updated_at DESC', [familyId, profileId]);
+      const out = r.rows.map((p) => ({ ...p, stats: progressStats({ levels: p.levels }, p.progress?.completed || []) }));
+      send(res, 200, { paths: out });
+      return;
+    }
+
+    // POST /learning/progress {path_id, family_id, completed_video_id} — track + next (SL07)
+    if (req.method === 'POST' && url.pathname === '/learning/progress') {
+      const b = await body(req);
+      if (!b.path_id || !b.family_id) { send(res, 400, { error: 'path_id + family_id required' }); return; }
+      if (req.headers['x-family-id'] !== b.family_id) { send(res, 403, { error: 'family mismatch (isolation)' }); return; }
+      const cur = await query('SELECT * FROM learning_paths WHERE id=$1 AND family_id=$2', [b.path_id, b.family_id]);
+      if (!cur.rows[0]) { send(res, 404, { error: 'path not found' }); return; }
+      const done = new Set([...(cur.rows[0].progress?.completed || []), ...(b.completed_video_id ? [b.completed_video_id] : [])]);
+      const upd = await query("UPDATE learning_paths SET progress=$1::jsonb, updated_at=now() WHERE id=$2 RETURNING *",
+        [JSON.stringify({ completed: [...done] }), b.path_id]);
+      const stats = progressStats({ levels: upd.rows[0].levels }, [...done]);
+      send(res, 200, { path: upd.rows[0], stats });
+      return;
+    }
+
     send(res, 404, { error: 'not-found' });
   } catch (e) {
     send(res, 500, { error: String(e.message || e) });
@@ -279,4 +320,4 @@ const server = http.createServer(async (req, res) => {
 });
 
 const port = process.env.PORT || 4000;
-server.listen(port, () => console.log(`tov-api phase4 on :${port}`));
+server.listen(port, () => console.log(`tov-api phase5 on :${port}`));
