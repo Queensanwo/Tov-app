@@ -1,0 +1,26 @@
+{
+  "version": 0,
+  "note": "Parent-first, strict family+profile isolation",
+  "roles": {
+    "parent_admin": {
+      "sees": ["all_profiles_in_family", "dashboard", "approvals", "screen_time", "remote_control"],
+      "can": ["create_profile", "edit_rules", "approve_reject", "pause_stop", "extend_time", "grant_trusted_adult"]
+    },
+    "child_managed": {
+      "sees": ["own_profile_only"],
+      "can": ["search", "watch", "report_dislike"]
+    },
+    "student": {
+      "sees": ["own_profile_only", "own_learning_path"],
+      "can": ["create_goal", "edit_path", "add_video", "request_help"]
+    },
+    "trusted_adult": {
+      "sees": ["granted_profiles_only"],
+      "can": ["view_activity", "extend_time", "approve_topic", "stop_playback", "send_video"]
+    }
+  },
+  "guards": {
+    "api": "requireFamily + requireRole + requireProfileScope",
+    "client": "/parent/* requires parent_admin, /child/* requires own profileId, /learn/* requires own profileId"
+  }
+}

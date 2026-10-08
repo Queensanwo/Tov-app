@@ -1,0 +1,12 @@
+{
+  "name": "tov-api",
+  "version": "0.0.1",
+  "type": "module",
+  "scripts": {
+    "dev": "node src/index.js",
+    "test": "node --test test/validate.test.js"
+  },
+  "dependencies": {
+    "pg": "^8.11.3"
+  }
+}

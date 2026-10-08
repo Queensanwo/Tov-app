@@ -1,0 +1,12 @@
+{
+  "name": "tov-monorepo",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*",
+    "workers/*"
+  ],
+  "scripts": {
+    "dev:api": "npm --workspace apps/api run dev"
+  }
+}
